@@ -1,0 +1,6 @@
+{
+  "name": "Chord Detector",
+  "description": "Real-time musical chord detection from microphone, audio files, and YouTube links with guitar string visualization.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
