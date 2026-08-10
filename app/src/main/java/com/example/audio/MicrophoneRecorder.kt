@@ -76,7 +76,10 @@ class MicrophoneRecorder(private val context: Context) {
                     val readSize = audioRecord?.read(buffer, 0, buffer.size) ?: -1
                     if (readSize > 0) {
                         val chunk = buffer.copyOf(readSize)
-                        withContext(Dispatchers.Main) {
+                        // Fire-and-forget so heavier chord-detection processing downstream
+                        // can never throttle how fast we drain the AudioRecord buffer --
+                        // otherwise mic reads back up and real-time listening gets laggy.
+                        scope.launch(Dispatchers.Main) {
                             onPcmBuffer(chunk)
                         }
                     }

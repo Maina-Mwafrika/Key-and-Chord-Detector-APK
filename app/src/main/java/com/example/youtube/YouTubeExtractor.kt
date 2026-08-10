@@ -150,7 +150,7 @@ class YouTubeExtractor(private val context: Context) {
                         .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
                         .build()
                 )
-                .setBufferSizeInBytes(maxOf(minBufSize, 4096 * 4))
+                .setBufferSizeInBytes(maxOf(minBufSize * 2, 4096 * 4))
                 .setTransferMode(AudioTrack.MODE_STREAM)
                 .build()
 
@@ -215,7 +215,10 @@ class YouTubeExtractor(private val context: Context) {
                     chordIndex++
                 }
 
-                withContext(Dispatchers.Main) {
+                // Fire-and-forget the UI/detection callback instead of suspending on it, so
+                // the tone-generation loop (which paces itself via the blocking AudioTrack
+                // write above) never gets held up by chord-detection processing time.
+                scope.launch(Dispatchers.Main) {
                     onPcmChunk(chunk)
                     onProgressUpdate(currentMs, totalMs)
                 }

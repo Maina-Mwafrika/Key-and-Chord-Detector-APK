@@ -25,23 +25,87 @@ class ChromaChordDetector(private val sampleRate: Int = 44100) {
         )
 
         val GUITAR_STRING_NAMES = arrayOf("E2", "A2", "D3", "G3", "B3", "E4")
+
+        // Frequency resolution = sampleRate / windowSize. A short 2048-sample window gives
+        // ~21.5 Hz/bin at 44.1kHz, which can't separate adjacent low notes (e.g. E2 vs F2 are
+        // only ~5 Hz apart). 16384 real samples (~371ms @ 44.1kHz) gives ~2.69 Hz/bin.
+        private const val ANALYSIS_WINDOW_SIZE = 16384
+
+        // Suppresses percussion/cymbal/vocal-sibilance energy above the guitar's useful
+        // fundamental+harmonic range so full song mixes don't pollute the chroma vector.
+        private const val LOWPASS_CUTOFF_HZ = 2500f
+
+        // --- Key stability tuning ---
+        // The key estimate is derived from a slow exponential moving average of the chroma
+        // vector, decayed very gradually so it reflects the song's overall tonal center
+        // rather than whichever chord happens to be ringing right now. A candidate key must
+        // stay different from the current stable key for this many milliseconds of real
+        // audio time before it's accepted -- this is what makes the displayed key static for
+        // a given song while still allowing genuine section-to-section modulations (a verse
+        // that goes up/down a key) to eventually be picked up.
+        private const val LONG_TERM_CHROMA_DECAY = 0.999f
+        private const val KEY_STABILITY_HOLD_MS = 8000f // ~4 bars @ 120bpm 4/4
+
+        // --- Chord "sustain per measure" tuning ---
+        // Chords in real playing don't change every FFT frame -- they're held for a bar
+        // before shifting. Instead of displaying whatever the current frame's best template
+        // match is, we tally a confidence-weighted vote for every frame's best-matching
+        // chord across a full measure, then at the measure boundary commit to whichever
+        // chord accumulated the strongest evidence and hold it on screen for the next
+        // measure. Minimum per-frame confidence to count towards a measure's vote at all.
+        private const val MEASURE_VOTE_MIN_CONFIDENCE = 0.15f
     }
 
     private val chordDatabase: List<ChordInfo> = buildChordDatabase()
     private val lastChromaHistory = mutableListOf<FloatArray>()
     private val maxHistoryFrames = 4
 
-    // Hysteresis tracking state for smooth chord transitions
-    private var stableChord: ChordInfo? = null
-    private var candidateChord: ChordInfo? = null
-    private var candidateFrameCount: Int = 0
-    private val requiredHoldFrames: Int = 3 // ~120ms-150ms transition delay window
+    // Rolling buffer that accumulates incoming PCM chunks (mic/file/YouTube callers all
+    // deliver short ~2048-sample chunks) into one long analysis window for the FFT.
+    private val analysisBuffer = FloatArray(ANALYSIS_WINDOW_SIZE)
+    private var analysisBufferFilled = 0
+
+    // --- Long-term key stability state ---
+    private val longTermChroma = FloatArray(12)
+    private var stableKeyName: String? = null
+    private var candidateKeyName: String? = null
+    private var candidateKeyElapsedMs: Float = 0f
+
+    // --- Measure-based chord sustain state ---
+    // name -> (cumulative confidence, vote count). Null key represents "no clear chord".
+    private var measureVotes = HashMap<String?, Pair<Float, Int>>()
+    private var measureElapsedMs: Float = 0f
+    private var currentMeasureChord: ChordInfo? = null
+    private var currentMeasureConfidence: Float = 0f
+    private var bpm: Int = 120
+    private var beatsPerMeasure: Int = 4
+    private val measureDurationMs: Float
+        get() = (60000f / bpm) * beatsPerMeasure
+
+    /**
+     * Lets the caller inform the detector of the song's actual tempo/time signature so the
+     * "hold chord for a measure" window matches the real bar length. Defaults to 120bpm 4/4
+     * (2000ms/measure) if never called.
+     */
+    fun setTempo(bpm: Int, beatsPerMeasure: Int = 4) {
+        this.bpm = bpm.coerceIn(20, 300)
+        this.beatsPerMeasure = beatsPerMeasure.coerceIn(1, 12)
+    }
 
     fun resetState() {
         lastChromaHistory.clear()
-        stableChord = null
-        candidateChord = null
-        candidateFrameCount = 0
+        analysisBuffer.fill(0f)
+        analysisBufferFilled = 0
+
+        longTermChroma.fill(0f)
+        stableKeyName = null
+        candidateKeyName = null
+        candidateKeyElapsedMs = 0f
+
+        measureVotes = HashMap()
+        measureElapsedMs = 0f
+        currentMeasureChord = null
+        currentMeasureConfidence = 0f
     }
 
     /**
@@ -65,10 +129,20 @@ class ChromaChordDetector(private val sampleRate: Int = 44100) {
         val rms = calculateRms(samples)
         val waveformPreview = extractWaveformPreview(samples, 64)
 
+        // Advance the measure clock using real audio time (not wall-clock), so the "hold for
+        // a bar" behavior stays correct regardless of how fast/slow the caller feeds chunks.
+        val frameDurationMs = (samples.size.toFloat() / sampleRate) * 1000f
+        measureElapsedMs += frameDurationMs
+
+        // Feed the rolling analysis buffer regardless of RMS gate, so it stays warm.
+        pushToAnalysisBuffer(samples)
+
         if (rms < thresholdRms) {
+            finalizeMeasureIfNeeded()
             return DetectionResult(
                 chord = null,
                 confidence = 0f,
+                estimatedKey = stableKeyName,
                 chromaVector = FloatArray(12),
                 stringEnergies = FloatArray(6),
                 waveform = waveformPreview,
@@ -76,18 +150,37 @@ class ChromaChordDetector(private val sampleRate: Int = 44100) {
             )
         }
 
-        // 1. Compute FFT Magnitudes
-        val n = getNextPowerOfTwo(samples.size.coerceAtMost(2048))
+        // Wait until we have a full real analysis window before trusting the FFT --
+        // otherwise early frames are mostly zero-padding and produce noisy guesses.
+        if (analysisBufferFilled < ANALYSIS_WINDOW_SIZE) {
+            finalizeMeasureIfNeeded()
+            return DetectionResult(
+                chord = null,
+                confidence = 0f,
+                estimatedKey = stableKeyName,
+                chromaVector = FloatArray(12),
+                stringEnergies = FloatArray(6),
+                waveform = waveformPreview,
+                status = DetectionStatus.PROCESSING
+            )
+        }
+
+        // 1. Low-pass filter the analysis window to de-emphasize percussion/vocal
+        //    content above the guitar's useful frequency range before FFT analysis.
+        val filtered = lowPassFilter(analysisBuffer, LOWPASS_CUTOFF_HZ)
+
+        // 2. Compute FFT Magnitudes over the full real analysis window
+        val n = ANALYSIS_WINDOW_SIZE // already a power of two
         val fftBuffer = FloatArray(n)
-        for (i in 0 until min(samples.size, n)) {
+        for (i in 0 until n) {
             // Hanning Window
             val window = 0.5f * (1.0f - cos(2.0 * PI * i / (n - 1)).toFloat())
-            fftBuffer[i] = samples[i] * window
+            fftBuffer[i] = filtered[i] * window
         }
 
         val magnitudes = computeFftMagnitudes(fftBuffer)
 
-        // 2. Build Chroma Vector
+        // 3. Build Chroma Vector
         val rawChroma = FloatArray(12)
         val binWidthHz = sampleRate.toFloat() / n
 
@@ -106,10 +199,12 @@ class ChromaChordDetector(private val sampleRate: Int = 44100) {
         // Normalize raw chroma
         val chromaVector = normalizeVector(rawChroma)
 
-        // 3. Smooth Chroma Vector across recent frames
+        // 4. Smooth Chroma Vector across a few recent frames (short-term, for live chroma
+        //    bar / string-energy visuals -- this is intentionally NOT the same signal used
+        //    for key estimation below).
         val smoothedChroma = smoothChroma(chromaVector)
 
-        // 4. Calculate Guitar String Energies
+        // 5. Calculate Guitar String Energies
         val stringEnergies = FloatArray(6)
         for (s in 0 until 6) {
             val stringFreq = GUITAR_STRING_FREQS[s]
@@ -131,10 +226,18 @@ class ChromaChordDetector(private val sampleRate: Int = 44100) {
             }
         }
 
-        // 5. Estimate Musical Key using Krumhansl-Schmuckler Key Profiling Algorithm
-        val estimatedKey = estimateKeyFromChroma(smoothedChroma)
+        // 6. Update the long-term key estimate. This chroma accumulator decays very slowly
+        //    (LONG_TERM_CHROMA_DECAY ~0.999) so it represents the song's cumulative tonal
+        //    center rather than the current chord -- a single chord's chroma barely moves it.
+        for (i in 0 until 12) {
+            longTermChroma[i] = longTermChroma[i] * LONG_TERM_CHROMA_DECAY +
+                chromaVector[i] * (1f - LONG_TERM_CHROMA_DECAY)
+        }
+        val candidateKey = estimateKeyFromChroma(normalizeVector(longTermChroma))
+        updateStableKey(candidateKey, frameDurationMs)
 
-        // 6. Template Match against Chord Database with Unbiased Scoring
+        // 7. Template Match against Chord Database with Unbiased Scoring (per-frame best
+        //    guess -- this feeds the per-measure vote below rather than being shown directly).
         var bestChord: ChordInfo? = null
         var bestScore = 0f
 
@@ -146,40 +249,115 @@ class ChromaChordDetector(private val sampleRate: Int = 44100) {
             }
         }
 
-        // Dynamic Confidence mapping
         val confidence = (bestScore * 1.15f).coerceIn(0f, 1f)
 
-        val rawDetectedChord = if (confidence > 0.35f) bestChord else null
-
-        // Apply tracking transition delay & debouncing hysteresis
-        if (rawDetectedChord?.name == stableChord?.name) {
-            candidateChord = null
-            candidateFrameCount = 0
-        } else {
-            if (rawDetectedChord?.name == candidateChord?.name) {
-                candidateFrameCount++
-                if (candidateFrameCount >= requiredHoldFrames) {
-                    stableChord = candidateChord
-                    candidateChord = null
-                    candidateFrameCount = 0
-                }
-            } else {
-                candidateChord = rawDetectedChord
-                candidateFrameCount = 1
-            }
+        // 8. Cast this frame's vote into the current measure's tally, weighted by confidence
+        //    so a clean strong match counts more than a noisy weak one.
+        if (confidence > MEASURE_VOTE_MIN_CONFIDENCE) {
+            val voteKey = bestChord?.name
+            val prev = measureVotes[voteKey] ?: (0f to 0)
+            measureVotes[voteKey] = (prev.first + confidence) to (prev.second + 1)
         }
-
-        val displayChord = stableChord
+        finalizeMeasureIfNeeded()
 
         return DetectionResult(
-            chord = displayChord,
-            confidence = confidence,
-            estimatedKey = if (confidence > 0.25f) estimatedKey else null,
+            chord = currentMeasureChord,
+            confidence = currentMeasureConfidence,
+            estimatedKey = stableKeyName,
             chromaVector = smoothedChroma,
             stringEnergies = stringEnergies,
             waveform = waveformPreview,
-            status = if (displayChord != null) DetectionStatus.DETECTED else DetectionStatus.PROCESSING
+            status = if (currentMeasureChord != null) DetectionStatus.DETECTED else DetectionStatus.PROCESSING
         )
+    }
+
+    /**
+     * If a full measure's worth of real audio time has elapsed, commit whichever chord
+     * accumulated the most confidence-weighted votes as the chord to display, and hold it
+     * until the next measure boundary. This is what makes the on-screen chord change on
+     * bar boundaries instead of flickering every FFT frame.
+     */
+    private fun finalizeMeasureIfNeeded() {
+        if (measureElapsedMs < measureDurationMs) return
+
+        val winnerEntry = measureVotes.maxByOrNull { it.value.first }
+        val winnerName = winnerEntry?.key
+        currentMeasureChord = if (winnerName != null) {
+            chordDatabase.find { it.name == winnerName }
+        } else {
+            null
+        }
+        currentMeasureConfidence = winnerEntry?.let { it.value.first / it.value.second } ?: 0f
+
+        measureVotes = HashMap()
+        measureElapsedMs = 0f
+    }
+
+    /**
+     * Applies hysteresis to the key estimate: a new candidate key must remain different from
+     * the current stable key for KEY_STABILITY_HOLD_MS of real audio time before it's
+     * accepted. This keeps the displayed key static through normal chord movement, while
+     * still allowing a real modulation (a section that goes up/down a key) to register after
+     * it's been sustained for a while.
+     */
+    private fun updateStableKey(candidateKey: String, frameDurationMs: Float) {
+        if (stableKeyName == null || candidateKey == stableKeyName) {
+            stableKeyName = candidateKey
+            candidateKeyName = null
+            candidateKeyElapsedMs = 0f
+            return
+        }
+
+        if (candidateKey == candidateKeyName) {
+            candidateKeyElapsedMs += frameDurationMs
+            if (candidateKeyElapsedMs >= KEY_STABILITY_HOLD_MS) {
+                stableKeyName = candidateKey
+                candidateKeyName = null
+                candidateKeyElapsedMs = 0f
+            }
+        } else {
+            candidateKeyName = candidateKey
+            candidateKeyElapsedMs = frameDurationMs
+        }
+    }
+
+    /**
+     * Shifts new samples into the rolling analysis buffer (FIFO), so the FFT always
+     * operates on the most recent ANALYSIS_WINDOW_SIZE real samples rather than a
+     * short zero-padded chunk.
+     */
+    private fun pushToAnalysisBuffer(newSamples: FloatArray) {
+        val incoming = if (newSamples.size >= analysisBuffer.size) {
+            newSamples.copyOfRange(newSamples.size - analysisBuffer.size, newSamples.size)
+        } else {
+            newSamples
+        }
+
+        val shiftAmount = incoming.size
+        if (shiftAmount >= analysisBuffer.size) {
+            System.arraycopy(incoming, 0, analysisBuffer, 0, analysisBuffer.size)
+        } else {
+            System.arraycopy(analysisBuffer, shiftAmount, analysisBuffer, 0, analysisBuffer.size - shiftAmount)
+            System.arraycopy(incoming, 0, analysisBuffer, analysisBuffer.size - shiftAmount, shiftAmount)
+        }
+        analysisBufferFilled = (analysisBufferFilled + shiftAmount).coerceAtMost(analysisBuffer.size)
+    }
+
+    /**
+     * Simple one-pole IIR low-pass filter. Used to attenuate percussion transients,
+     * cymbals, and vocal sibilance above the guitar's useful fundamental+harmonic
+     * range before chroma extraction, so full song mixes don't pollute the chord match.
+     */
+    private fun lowPassFilter(input: FloatArray, cutoffHz: Float): FloatArray {
+        val rc = 1.0f / (2f * PI.toFloat() * cutoffHz)
+        val dt = 1.0f / sampleRate
+        val alpha = dt / (rc + dt)
+        val output = FloatArray(input.size)
+        output[0] = input[0]
+        for (i in 1 until input.size) {
+            output[i] = output[i - 1] + alpha * (input[i] - output[i - 1])
+        }
+        return output
     }
 
     private fun calculateRms(samples: FloatArray): Float {

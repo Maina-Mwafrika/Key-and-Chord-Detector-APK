@@ -112,7 +112,17 @@ class FileProcessor(private val context: Context) {
                 val durationUs = if (format.containsKey(MediaFormat.KEY_DURATION)) format.getLong(MediaFormat.KEY_DURATION) else 0L
                 val sampleRate = if (format.containsKey(MediaFormat.KEY_SAMPLE_RATE)) format.getInteger(MediaFormat.KEY_SAMPLE_RATE) else 44100
 
-                // Initialize AudioTrack for real-time sound output
+                // IMPORTANT: most audio files are stereo. MediaCodec decodes to interleaved
+                // L,R,L,R... 16-bit PCM. Previously this was blindly treated as mono, which
+                // packed 2 samples' worth of playback time into every "1 mono sample" slot --
+                // that plays the file back at roughly half speed (lower pitch, stretched/
+                // delayed sound). We downmix to true mono below so both AudioTrack playback
+                // and the chord detector see a correctly-paced, single-channel signal.
+                val channelCount = (if (format.containsKey(MediaFormat.KEY_CHANNEL_COUNT))
+                    format.getInteger(MediaFormat.KEY_CHANNEL_COUNT) else 1).coerceAtLeast(1)
+
+                // Initialize AudioTrack for real-time sound output (always mono output,
+                // since we downmix before writing)
                 val minBufSize = AudioTrack.getMinBufferSize(
                     sampleRate,
                     AudioFormat.CHANNEL_OUT_MONO,
@@ -133,7 +143,9 @@ class FileProcessor(private val context: Context) {
                                 .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
                                 .build()
                         )
-                        .setBufferSizeInBytes(maxOf(minBufSize, 4096 * 4))
+                        // Slightly larger buffer gives extra headroom so chord-detection
+                        // processing on the callback thread can never starve playback.
+                        .setBufferSizeInBytes(maxOf(minBufSize * 2, 4096 * 4))
                         .setTransferMode(AudioTrack.MODE_STREAM)
                         .build()
                     audioTrack?.play()
@@ -182,10 +194,25 @@ class FileProcessor(private val context: Context) {
                             val pcmBytes = ByteArray(info.size)
                             outBuf.get(pcmBytes)
 
-                            // Convert 16-bit PCM bytes to Shorts
-                            val shortBuf = ByteBuffer.wrap(pcmBytes).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer()
-                            while (shortBuf.hasRemaining()) {
-                                shortBuffer[bufferIdx++] = shortBuf.get()
+                            // Convert 16-bit PCM bytes to Shorts, downmixing to mono if the
+                            // source has more than one channel (averaging all channels per
+                            // frame) so playback speed/pitch and detector input stay correct.
+                            val rawShortBuf = ByteBuffer.wrap(pcmBytes).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer()
+                            val monoSamples: ShortArray = if (channelCount > 1) {
+                                val frameCount = rawShortBuf.remaining() / channelCount
+                                ShortArray(frameCount) {
+                                    var sum = 0
+                                    for (c in 0 until channelCount) {
+                                        sum += rawShortBuf.get()
+                                    }
+                                    (sum / channelCount).toShort()
+                                }
+                            } else {
+                                ShortArray(rawShortBuf.remaining()) { rawShortBuf.get() }
+                            }
+
+                            for (sample in monoSamples) {
+                                shortBuffer[bufferIdx++] = sample
                                 if (bufferIdx >= chunkSize) {
                                     val chunk = shortBuffer.copyOf()
                                     val currentMs = info.presentationTimeUs / 1000
@@ -196,7 +223,13 @@ class FileProcessor(private val context: Context) {
                                     ByteBuffer.wrap(byteChunk).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().put(chunk)
                                     audioTrack?.write(byteChunk, 0, byteChunk.size)
 
-                                    withContext(Dispatchers.Main) {
+                                    // Fire-and-forget the UI/detection callback instead of
+                                    // suspending on it. Chord detection now does a heavier
+                                    // FFT; blocking this decode loop on it let playback fall
+                                    // behind real time and stutter/distort. The audio has
+                                    // already been queued to AudioTrack above, so playback
+                                    // timing no longer depends on how long detection takes.
+                                    scope.launch(Dispatchers.Main) {
                                         onPcmChunk(chunk)
                                         onProgressUpdate(currentMs, totalMs)
                                     }
