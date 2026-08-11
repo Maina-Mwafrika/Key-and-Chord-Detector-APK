@@ -28,8 +28,9 @@ class ChromaChordDetector(private val sampleRate: Int = 44100) {
 
         // Frequency resolution = sampleRate / windowSize. A short 2048-sample window gives
         // ~21.5 Hz/bin at 44.1kHz, which can't separate adjacent low notes (e.g. E2 vs F2 are
-        // only ~5 Hz apart). 16384 real samples (~371ms @ 44.1kHz) gives ~2.69 Hz/bin.
-        private const val ANALYSIS_WINDOW_SIZE = 16384
+        // only ~5 Hz apart). 16384 real samples (~371ms @ 44.1kHz) gives ~2.69 Hz/bin. Public
+        // so SongAnalyzer's offline windowing stays consistent with the live path.
+        const val ANALYSIS_WINDOW_SIZE = 16384
 
         // Suppresses percussion/cymbal/vocal-sibilance energy above the guitar's useful
         // fundamental+harmonic range so full song mixes don't pollute the chroma vector.
@@ -42,21 +43,19 @@ class ChromaChordDetector(private val sampleRate: Int = 44100) {
         // stay different from the current stable key for this many milliseconds of real
         // audio time before it's accepted -- this is what makes the displayed key static for
         // a given song while still allowing genuine section-to-section modulations (a verse
-        // that goes up/down a key) to eventually be picked up.
+        // that goes up/down a key) to eventually be picked up. (Only used by the live
+        // streaming path -- SongAnalyzer determines key once, offline, from the whole song.)
         private const val LONG_TERM_CHROMA_DECAY = 0.999f
         private const val KEY_STABILITY_HOLD_MS = 8000f // ~4 bars @ 120bpm 4/4
 
-        // --- Chord "sustain per measure" tuning ---
-        // Chords in real playing don't change every FFT frame -- they're held for a bar
-        // before shifting. Instead of displaying whatever the current frame's best template
-        // match is, we tally a confidence-weighted vote for every frame's best-matching
-        // chord across a full measure, then at the measure boundary commit to whichever
-        // chord accumulated the strongest evidence and hold it on screen for the next
-        // measure. Minimum per-frame confidence to count towards a measure's vote at all.
+        // --- Chord "sustain per measure" tuning (live streaming path only) ---
         private const val MEASURE_VOTE_MIN_CONFIDENCE = 0.15f
     }
 
-    private val chordDatabase: List<ChordInfo> = buildChordDatabase()
+    // Public so SongAnalyzer can build filtered candidate lists (e.g. diatonic-only chords
+    // for "Simple" mode) from the same chord vocabulary the live detector uses.
+    val chordDatabase: List<ChordInfo> = buildChordDatabase()
+
     private val lastChromaHistory = mutableListOf<FloatArray>()
     private val maxHistoryFrames = 4
 
@@ -65,13 +64,13 @@ class ChromaChordDetector(private val sampleRate: Int = 44100) {
     private val analysisBuffer = FloatArray(ANALYSIS_WINDOW_SIZE)
     private var analysisBufferFilled = 0
 
-    // --- Long-term key stability state ---
+    // --- Long-term key stability state (live streaming path) ---
     private val longTermChroma = FloatArray(12)
     private var stableKeyName: String? = null
     private var candidateKeyName: String? = null
     private var candidateKeyElapsedMs: Float = 0f
 
-    // --- Measure-based chord sustain state ---
+    // --- Measure-based chord sustain state (live streaming path) ---
     // name -> (cumulative confidence, vote count). Null key represents "no clear chord".
     private var measureVotes = HashMap<String?, Pair<Float, Int>>()
     private var measureElapsedMs: Float = 0f
@@ -85,7 +84,7 @@ class ChromaChordDetector(private val sampleRate: Int = 44100) {
     /**
      * Lets the caller inform the detector of the song's actual tempo/time signature so the
      * "hold chord for a measure" window matches the real bar length. Defaults to 120bpm 4/4
-     * (2000ms/measure) if never called.
+     * (2000ms/measure) if never called. Only affects the live streaming path.
      */
     fun setTempo(bpm: Int, beatsPerMeasure: Int = 4) {
         this.bpm = bpm.coerceIn(20, 300)
@@ -120,7 +119,9 @@ class ChromaChordDetector(private val sampleRate: Int = 44100) {
     }
 
     /**
-     * Process float PCM samples (-1.0 to 1.0)
+     * Process float PCM samples (-1.0 to 1.0). This is the live/streaming path (mic, real-time
+     * file/YouTube playback preview). For uploaded songs, prefer SongAnalyzer's offline,
+     * whole-song analysis for a stable key and clean per-measure chords with zero jitter.
      */
     fun processPcmSamples(
         samples: FloatArray,
@@ -165,43 +166,14 @@ class ChromaChordDetector(private val sampleRate: Int = 44100) {
             )
         }
 
-        // 1. Low-pass filter the analysis window to de-emphasize percussion/vocal
-        //    content above the guitar's useful frequency range before FFT analysis.
-        val filtered = lowPassFilter(analysisBuffer, LOWPASS_CUTOFF_HZ)
-
-        // 2. Compute FFT Magnitudes over the full real analysis window
-        val n = ANALYSIS_WINDOW_SIZE // already a power of two
-        val fftBuffer = FloatArray(n)
-        for (i in 0 until n) {
-            // Hanning Window
-            val window = 0.5f * (1.0f - cos(2.0 * PI * i / (n - 1)).toFloat())
-            fftBuffer[i] = filtered[i] * window
-        }
-
-        val magnitudes = computeFftMagnitudes(fftBuffer)
-
-        // 3. Build Chroma Vector
-        val rawChroma = FloatArray(12)
-        val binWidthHz = sampleRate.toFloat() / n
-
-        for (k in 1 until magnitudes.size) {
-            val freq = k * binWidthHz
-            if (freq in 60.0f..2200.0f) {
-                val mag = magnitudes[k]
-                if (mag > 0.001f) {
-                    val midiPitch = 69.0f + 12.0f * log2(freq / 440.0f)
-                    val chromaIndex = (midiPitch.roundToInt() % 12 + 12) % 12
-                    rawChroma[chromaIndex] += mag * mag
-                }
-            }
-        }
-
-        // Normalize raw chroma
-        val chromaVector = normalizeVector(rawChroma)
+        // 1-3. Low-pass filter + windowed FFT + chroma extraction. Shared with offline
+        //      analysis (via analyzeChroma) so live and offline paths can't drift apart.
+        val (magnitudes, chromaVector) = computeMagnitudesAndChroma(analysisBuffer)
+        val binWidthHz = sampleRate.toFloat() / ANALYSIS_WINDOW_SIZE
 
         // 4. Smooth Chroma Vector across a few recent frames (short-term, for live chroma
-        //    bar / string-energy visuals -- this is intentionally NOT the same signal used
-        //    for key estimation below).
+        //    bar / string-energy visuals -- intentionally NOT the same signal used for key
+        //    estimation below).
         val smoothedChroma = smoothChroma(chromaVector)
 
         // 5. Calculate Guitar String Energies
@@ -219,11 +191,13 @@ class ChromaChordDetector(private val sampleRate: Int = 44100) {
             }
             stringEnergies[s] = totalEnergy
         }
-        val maxStringEnergy = stringEnergies.maxOrNull() ?: 1.0f
-        if (maxStringEnergy > 0f) {
+        val maxStringEnergy = stringEnergies.maxOrNull() ?: 0f
+        if (maxStringEnergy > 0.05f) {
             for (i in 0 until 6) {
                 stringEnergies[i] = (stringEnergies[i] / maxStringEnergy).coerceIn(0f, 1f)
             }
+        } else {
+            stringEnergies.fill(0f)
         }
 
         // 6. Update the long-term key estimate. This chroma accumulator decays very slowly
@@ -238,18 +212,7 @@ class ChromaChordDetector(private val sampleRate: Int = 44100) {
 
         // 7. Template Match against Chord Database with Unbiased Scoring (per-frame best
         //    guess -- this feeds the per-measure vote below rather than being shown directly).
-        var bestChord: ChordInfo? = null
-        var bestScore = 0f
-
-        for (chord in chordDatabase) {
-            val score = evaluateChordScore(smoothedChroma, chord)
-            if (score > bestScore) {
-                bestScore = score
-                bestChord = chord
-            }
-        }
-
-        val confidence = (bestScore * 1.15f).coerceIn(0f, 1f)
+        val (bestChord, confidence) = matchChord(smoothedChroma)
 
         // 8. Cast this frame's vote into the current measure's tally, weighted by confidence
         //    so a clean strong match counts more than a noisy weak one.
@@ -269,6 +232,99 @@ class ChromaChordDetector(private val sampleRate: Int = 44100) {
             waveform = waveformPreview,
             status = if (currentMeasureChord != null) DetectionStatus.DETECTED else DetectionStatus.PROCESSING
         )
+    }
+
+    // Reusable scratch buffers for zero-allocation window processing
+    private val scratchFiltered = FloatArray(ANALYSIS_WINDOW_SIZE)
+    private val scratchReal = FloatArray(ANALYSIS_WINDOW_SIZE)
+    private val scratchImag = FloatArray(ANALYSIS_WINDOW_SIZE)
+
+    /**
+     * Computes a normalized 12-bin chroma vector for an arbitrary window of raw mono float
+     * PCM samples (window size should be a power of two -- SongAnalyzer always uses
+     * ANALYSIS_WINDOW_SIZE). Public so SongAnalyzer's offline, whole-song analysis uses
+     * exactly the same signal processing as the live streaming path.
+     */
+    fun analyzeChroma(samples: FloatArray, offset: Int = 0, length: Int = samples.size): FloatArray {
+        if (length <= 0 || offset < 0 || offset + length > samples.size) {
+            return FloatArray(12)
+        }
+
+        // Cheap RMS check: skip near-silent windows before running filter + 16384-point FFT
+        var sumSq = 0f
+        val stride = 8
+        var i = offset
+        val end = offset + length
+        var count = 0
+        while (i < end) {
+            val s = samples[i]
+            sumSq += s * s
+            i += stride
+            count++
+        }
+        val approxRms = sqrt(sumSq / count.coerceAtLeast(1))
+        if (approxRms < 0.003f) {
+            return FloatArray(12)
+        }
+
+        return computeMagnitudesAndChroma(samples, offset, length).second
+    }
+
+    /**
+     * Finds the best-matching chord for a chroma vector against a candidate list (defaults
+     * to the full chord database). Returns the chord and a 0..1 confidence score. Shared by
+     * the live streaming path and SongAnalyzer's offline per-measure matching -- SongAnalyzer
+     * passes a restricted candidate list (diatonic-only) for "Simple" mode.
+     */
+    fun matchChord(chroma: FloatArray, candidates: List<ChordInfo> = chordDatabase): Pair<ChordInfo?, Float> {
+        var bestChord: ChordInfo? = null
+        var bestScore = 0f
+
+        for (chord in candidates) {
+            val score = evaluateChordScore(chroma, chord)
+            if (score > bestScore) {
+                bestScore = score
+                bestChord = chord
+            }
+        }
+
+        val confidence = (bestScore * 1.15f).coerceIn(0f, 1f)
+        return bestChord to confidence
+    }
+
+    /**
+     * Krumhansl-Schmuckler Key Finder:
+     * Calculates Pearson correlation between chroma vector and 24 major/minor key profiles.
+     * Public so SongAnalyzer can call it directly on a whole-song chroma accumulation.
+     */
+    fun estimateKeyFromChroma(chroma: FloatArray): String {
+        val krumhanslMajor = floatArrayOf(6.35f, 2.23f, 3.48f, 2.33f, 4.38f, 4.09f, 2.52f, 5.19f, 2.39f, 3.66f, 2.29f, 2.88f)
+        val krumhanslMinor = floatArrayOf(6.33f, 2.68f, 3.52f, 5.38f, 2.60f, 3.53f, 2.54f, 4.75f, 2.69f, 3.34f, 3.17f, 3.28f)
+
+        var bestKeyName = "C Major"
+        var bestCorrelation = -2f
+
+        for (rootShift in 0 until 12) {
+            val rootName = NOTE_NAMES[rootShift]
+
+            // Test Major profile
+            val rotatedMajor = FloatArray(12) { krumhanslMajor[(it - rootShift + 12) % 12] }
+            val corrMaj = pearsonCorrelation(chroma, rotatedMajor)
+            if (corrMaj > bestCorrelation) {
+                bestCorrelation = corrMaj
+                bestKeyName = "Key of $rootName Major"
+            }
+
+            // Test Minor profile
+            val rotatedMinor = FloatArray(12) { krumhanslMinor[(it - rootShift + 12) % 12] }
+            val corrMin = pearsonCorrelation(chroma, rotatedMinor)
+            if (corrMin > bestCorrelation) {
+                bestCorrelation = corrMin
+                bestKeyName = "Key of ${rootName}m (Minor)"
+            }
+        }
+
+        return bestKeyName
     }
 
     /**
@@ -348,16 +404,70 @@ class ChromaChordDetector(private val sampleRate: Int = 44100) {
      * cymbals, and vocal sibilance above the guitar's useful fundamental+harmonic
      * range before chroma extraction, so full song mixes don't pollute the chord match.
      */
-    private fun lowPassFilter(input: FloatArray, cutoffHz: Float): FloatArray {
+    private fun lowPassFilterInPlace(
+        input: FloatArray,
+        offset: Int,
+        length: Int,
+        output: FloatArray,
+        cutoffHz: Float
+    ) {
         val rc = 1.0f / (2f * PI.toFloat() * cutoffHz)
         val dt = 1.0f / sampleRate
         val alpha = dt / (rc + dt)
-        val output = FloatArray(input.size)
-        output[0] = input[0]
-        for (i in 1 until input.size) {
-            output[i] = output[i - 1] + alpha * (input[i] - output[i - 1])
+        output[0] = input[offset]
+        for (i in 1 until length) {
+            output[i] = output[i - 1] + alpha * (input[offset + i] - output[i - 1])
         }
-        return output
+    }
+
+    /**
+     * Shared core of chroma extraction: low-pass filter -> Hanning-windowed FFT -> 12-bin
+     * chroma vector. Returns both the raw FFT magnitude spectrum (needed by the live path
+     * for guitar string-energy calculation) and the normalized chroma vector. Used by both
+     * processPcmSamples (live) and analyzeChroma (offline), so the two paths can never
+     * silently diverge in behavior.
+     */
+    private fun computeMagnitudesAndChroma(
+        samples: FloatArray,
+        offset: Int = 0,
+        length: Int = samples.size
+    ): Pair<FloatArray, FloatArray> {
+        val n = length
+        val filtered = if (n == ANALYSIS_WINDOW_SIZE) scratchFiltered else FloatArray(n)
+        lowPassFilterInPlace(samples, offset, n, filtered, LOWPASS_CUTOFF_HZ)
+
+        val real = if (n == ANALYSIS_WINDOW_SIZE) scratchReal else FloatArray(n)
+        val imag = if (n == ANALYSIS_WINDOW_SIZE) scratchImag else FloatArray(n)
+        imag.fill(0f)
+
+        for (i in 0 until n) {
+            val hann = 0.5f * (1.0f - cos(2.0 * PI * i / (n - 1)).toFloat())
+            real[i] = filtered[i] * hann
+        }
+
+        computeFftInPlace(real, imag)
+
+        val half = n / 2
+        val magnitudes = FloatArray(half)
+        for (i in 0 until half) {
+            magnitudes[i] = sqrt(real[i] * real[i] + imag[i] * imag[i])
+        }
+
+        val binWidthHz = sampleRate.toFloat() / n
+        val rawChroma = FloatArray(12)
+        for (k in 1 until magnitudes.size) {
+            val freq = k * binWidthHz
+            if (freq in 60.0f..2200.0f) {
+                val mag = magnitudes[k]
+                if (mag > 0.001f) {
+                    val midiPitch = 69.0f + 12.0f * log2(freq / 440.0f)
+                    val chromaIndex = (midiPitch.roundToInt() % 12 + 12) % 12
+                    rawChroma[chromaIndex] += mag * mag
+                }
+            }
+        }
+
+        return magnitudes to normalizeVector(rawChroma)
     }
 
     private fun calculateRms(samples: FloatArray): Float {
@@ -437,40 +547,6 @@ class ChromaChordDetector(private val sampleRate: Int = 44100) {
         return (matchRatio - unmatchedNoiseEnergy).coerceIn(0f, 1f)
     }
 
-    /**
-     * Krumhansl-Schmuckler Key Finder:
-     * Calculates Pearson correlation between chroma vector and 24 major/minor key profiles.
-     */
-    private fun estimateKeyFromChroma(chroma: FloatArray): String {
-        val krumhanslMajor = floatArrayOf(6.35f, 2.23f, 3.48f, 2.33f, 4.38f, 4.09f, 2.52f, 5.19f, 2.39f, 3.66f, 2.29f, 2.88f)
-        val krumhanslMinor = floatArrayOf(6.33f, 2.68f, 3.52f, 5.38f, 2.60f, 3.53f, 2.54f, 4.75f, 2.69f, 3.34f, 3.17f, 3.28f)
-
-        var bestKeyName = "C Major"
-        var bestCorrelation = -2f
-
-        for (rootShift in 0 until 12) {
-            val rootName = NOTE_NAMES[rootShift]
-
-            // Test Major profile
-            val rotatedMajor = FloatArray(12) { krumhanslMajor[(it - rootShift + 12) % 12] }
-            val corrMaj = pearsonCorrelation(chroma, rotatedMajor)
-            if (corrMaj > bestCorrelation) {
-                bestCorrelation = corrMaj
-                bestKeyName = "Key of $rootName Major"
-            }
-
-            // Test Minor profile
-            val rotatedMinor = FloatArray(12) { krumhanslMinor[(it - rootShift + 12) % 12] }
-            val corrMin = pearsonCorrelation(chroma, rotatedMinor)
-            if (corrMin > bestCorrelation) {
-                bestCorrelation = corrMin
-                bestKeyName = "Key of ${rootName}m (Minor)"
-            }
-        }
-
-        return bestKeyName
-    }
-
     private fun pearsonCorrelation(x: FloatArray, y: FloatArray): Float {
         var sumX = 0f
         var sumY = 0f
@@ -515,12 +591,10 @@ class ChromaChordDetector(private val sampleRate: Int = 44100) {
     }
 
     /**
-     * Radix-2 Cooley-Tukey FFT implementation in Kotlin
+     * Radix-2 Cooley-Tukey in-place FFT implementation in Kotlin (zero allocations)
      */
-    private fun computeFftMagnitudes(input: FloatArray): FloatArray {
-        val n = input.size
-        val real = input.clone()
-        val imag = FloatArray(n)
+    private fun computeFftInPlace(real: FloatArray, imag: FloatArray) {
+        val n = real.size
 
         // Bit reversal permutation
         var j = 0
@@ -529,6 +603,9 @@ class ChromaChordDetector(private val sampleRate: Int = 44100) {
                 val tempR = real[i]
                 real[i] = real[j]
                 real[j] = tempR
+                val tempI = imag[i]
+                imag[i] = imag[j]
+                imag[j] = tempI
             }
             var k = n shr 1
             while (k <= j) {
@@ -571,13 +648,6 @@ class ChromaChordDetector(private val sampleRate: Int = 44100) {
             }
             len = len shl 1
         }
-
-        val half = n / 2
-        val magnitudes = FloatArray(half)
-        for (i in 0 until half) {
-            magnitudes[i] = sqrt(real[i] * real[i] + imag[i] * imag[i])
-        }
-        return magnitudes
     }
 
     private fun buildChordDatabase(): List<ChordInfo> {
@@ -681,6 +751,22 @@ class ChromaChordDetector(private val sampleRate: Int = 44100) {
                     notes = listOf(cMaj, sus4Note, gMaj),
                     fretDiagram = getFretDiagramForChord(root, "sus4"),
                     description = "Suspended 4th chord ($cMaj - $sus4Note - $gMaj)"
+                )
+            )
+
+            // 8. Diminished (Root, +3, +6) -- needed so "Simple" mode can represent the
+            //    vii° diatonic chord in major keys (and ii° in natural minor keys). No
+            //    curated fret diagram data exists for these yet, so they fall back to the
+            //    generic default shape in getFretDiagramForChord below.
+            val dimNote = noteAt(6)
+            list.add(
+                ChordInfo(
+                    name = "${root}dim",
+                    rootNote = root,
+                    chordType = "Diminished",
+                    notes = listOf(cMaj, eMin, dimNote),
+                    fretDiagram = getFretDiagramForChord(root, "dim"),
+                    description = "Tense, unresolved diminished triad ($cMaj - $eMin - $dimNote)"
                 )
             )
         }

@@ -1,12 +1,5 @@
 package com.example.ui.components
 
-import androidx.compose.animation.AnimatedContent
-import androidx.compose.animation.ExperimentalAnimationApi
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.scaleIn
-import androidx.compose.animation.scaleOut
-import androidx.compose.animation.with
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -46,6 +39,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.audio.ChordCarouselState
 import com.example.audio.ChordInfo
 import com.example.audio.DetectionResult
 import com.example.audio.DetectionStatus
@@ -56,10 +50,10 @@ import com.example.ui.theme.PrimaryGreen
 import com.example.ui.theme.PrimaryGreenLight
 import com.example.ui.theme.SecondaryCyan
 
-@OptIn(ExperimentalAnimationApi::class)
 @Composable
 fun ChordDisplay(
     detectionResult: DetectionResult,
+    carousel: ChordCarouselState = ChordCarouselState(),
     modifier: Modifier = Modifier
 ) {
     var showDiagramModal by remember { mutableStateOf(false) }
@@ -166,23 +160,15 @@ fun ChordDisplay(
 
             Spacer(modifier = Modifier.height(16.dp))
 
-            // Main Hero Chord Name Display
-            AnimatedContent(
-                targetState = chord?.name ?: "...",
-                transitionSpec = {
-                    (fadeIn() + scaleIn()).with(fadeOut() + scaleOut())
-                },
-                label = "chord_text"
-            ) { chordName ->
-                Text(
-                    text = chordName,
-                    fontSize = 58.sp,
-                    fontWeight = FontWeight.Black,
-                    color = if (isDetected) PrimaryGreenLight else MaterialTheme.colorScheme.onSurfaceVariant,
-                    letterSpacing = 1.sp,
-                    modifier = Modifier.testTag("detected_chord_name")
-                )
-            }
+            // Chord Carousel: previous / current / next -- lets the player see what's
+            // coming and what just passed, not just the instantaneous chord.
+            ChordCarousel(
+                previous = carousel.previous,
+                current = chord,
+                next = carousel.next,
+                isDetected = isDetected,
+                modifier = Modifier.testTag("detected_chord_name")
+            )
 
             Spacer(modifier = Modifier.height(6.dp))
 

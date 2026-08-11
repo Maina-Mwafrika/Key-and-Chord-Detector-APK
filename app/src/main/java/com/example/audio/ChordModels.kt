@@ -15,6 +15,18 @@ enum class DetectionStatus {
 }
 
 /**
+ * Controls how uploaded songs are chord-matched:
+ * - SIMPLE: the chord for each measure is matched only against the diatonic chords of the
+ *   song's detected key (so results always "make sense" within the key).
+ * - ADVANCED: the full chord vocabulary is available, so borrowed/chromatic chords outside
+ *   the diatonic set can be detected.
+ */
+enum class ChordComplexityMode {
+    SIMPLE,
+    ADVANCED
+}
+
+/**
  * Represents guitar string frets: 6th string (Low E) to 1st string (High E).
  * -1 = Muted/Don't play, 0 = Open string, 1..12 = Fret number
  */
@@ -97,3 +109,58 @@ data class ChordHistoryItem(
     val inputSource: String,
     val notes: List<String>
 )
+
+/**
+ * The winning chord for a single measure of an offline-analyzed song, plus the time range
+ * it covers and how confidently it matched.
+ */
+data class MeasureChord(
+    val measureIndex: Int,
+    val startMs: Long,
+    val endMs: Long,
+    val chord: ChordInfo?,
+    val confidence: Float
+)
+
+/**
+ * The full result of SongAnalyzer's one-time, offline analysis of an uploaded song: a
+ * single overall key plus a chord for every measure. Playback looks up the current chord
+ * by position in this timeline instead of re-running live detection, so display is
+ * perfectly smooth and synced.
+ */
+data class SongChordTimeline(
+    val key: String,
+    val bpm: Int,
+    val beatsPerMeasure: Int,
+    val measureDurationMs: Long,
+    val measures: List<MeasureChord>,
+    val totalDurationMs: Long,
+    val chordMode: ChordComplexityMode
+) {
+    fun measureIndexAt(positionMs: Long): Int {
+        if (measureDurationMs <= 0 || measures.isEmpty()) return 0
+        val idx = (positionMs / measureDurationMs).toInt()
+        return idx.coerceIn(0, measures.size - 1)
+    }
+}
+
+/**
+ * The previous / current / next chord to show in the carousel-style chord visualization.
+ * For live/streaming input (no precomputed timeline), "next" is unknowable and stays null.
+ */
+data class ChordCarouselState(
+    val previous: ChordInfo? = null,
+    val current: ChordInfo? = null,
+    val next: ChordInfo? = null,
+    val measureIndex: Int = -1
+)
+
+/**
+ * Tracks the progress of SongAnalyzer's offline pre-processing of an uploaded file.
+ */
+sealed class SongAnalysisState {
+    object Idle : SongAnalysisState()
+    data class Analyzing(val progress: Float, val stage: String = "Analyzing") : SongAnalysisState()
+    object Ready : SongAnalysisState()
+    data class Error(val message: String) : SongAnalysisState()
+}

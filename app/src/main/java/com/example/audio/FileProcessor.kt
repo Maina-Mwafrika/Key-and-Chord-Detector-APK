@@ -73,6 +73,7 @@ class FileProcessor(private val context: Context) {
         scope: CoroutineScope,
         uri: Uri,
         detector: ChromaChordDetector,
+        startMs: Long = 0L,
         onProgressUpdate: (currentMs: Long, totalMs: Long) -> Unit,
         onPcmChunk: (ShortArray) -> Unit,
         onError: (String) -> Unit
@@ -108,6 +109,9 @@ class FileProcessor(private val context: Context) {
                 }
 
                 extractor.selectTrack(audioTrackIdx)
+                if (startMs > 0L) {
+                    extractor.seekTo(startMs * 1000L, MediaExtractor.SEEK_TO_CLOSEST_SYNC)
+                }
                 val mime = format.getString(MediaFormat.KEY_MIME) ?: ""
                 val durationUs = if (format.containsKey(MediaFormat.KEY_DURATION)) format.getLong(MediaFormat.KEY_DURATION) else 0L
                 val sampleRate = if (format.containsKey(MediaFormat.KEY_SAMPLE_RATE)) format.getInteger(MediaFormat.KEY_SAMPLE_RATE) else 44100
