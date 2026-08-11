@@ -50,6 +50,17 @@ class ChromaChordDetector(private val sampleRate: Int = 44100) {
 
         // --- Chord "sustain per measure" tuning (live streaming path only) ---
         private const val MEASURE_VOTE_MIN_CONFIDENCE = 0.15f
+
+        // --- Adaptive noise floor tuning (live streaming path only) ---
+        // A single fixed RMS gate is either too strict in a noisy room or too loose (picks up
+        // constant mic self-noise/hiss as "notes") on a hot/sensitive mic. Instead, the first
+        // NOISE_CALIBRATION_MS of a session is treated as ambient noise and averaged into a
+        // floor specific to this device/room; after that, the actual voice-activity gate is a
+        // multiple of that floor, clamped to a sane range. See processPcmSamples().
+        private const val NOISE_CALIBRATION_MS = 400f
+        private const val NOISE_FLOOR_MULTIPLIER = 3f
+        private const val MIN_ADAPTIVE_THRESHOLD = 0.004f
+        private const val MAX_ADAPTIVE_THRESHOLD = 0.05f
     }
 
     // Public so SongAnalyzer can build filtered candidate lists (e.g. diatonic-only chords
@@ -81,6 +92,14 @@ class ChromaChordDetector(private val sampleRate: Int = 44100) {
     private val measureDurationMs: Float
         get() = (60000f / bpm) * beatsPerMeasure
 
+    // --- Adaptive noise floor state (live streaming path) ---
+    // adaptiveNoiseFloor stays null until NOISE_CALIBRATION_MS of real audio time has been
+    // observed; until then processPcmSamples falls back to its thresholdRms parameter.
+    private var noiseCalibrationElapsedMs = 0f
+    private var noiseCalibrationRmsSum = 0f
+    private var noiseCalibrationFrameCount = 0
+    private var adaptiveNoiseFloor: Float? = null
+
     /**
      * Lets the caller inform the detector of the song's actual tempo/time signature so the
      * "hold chord for a measure" window matches the real bar length. Defaults to 120bpm 4/4
@@ -105,6 +124,13 @@ class ChromaChordDetector(private val sampleRate: Int = 44100) {
         measureElapsedMs = 0f
         currentMeasureChord = null
         currentMeasureConfidence = 0f
+
+        // Re-calibrate the noise floor for every new session (mic restarted, mode switched,
+        // etc.) rather than carrying over a stale estimate from a previous room/recording.
+        noiseCalibrationElapsedMs = 0f
+        noiseCalibrationRmsSum = 0f
+        noiseCalibrationFrameCount = 0
+        adaptiveNoiseFloor = null
     }
 
     /**
@@ -135,10 +161,32 @@ class ChromaChordDetector(private val sampleRate: Int = 44100) {
         val frameDurationMs = (samples.size.toFloat() / sampleRate) * 1000f
         measureElapsedMs += frameDurationMs
 
+        // --- Adaptive noise floor calibration ---
+        // For the first NOISE_CALIBRATION_MS of a session, every incoming frame is assumed to
+        // be ambient noise (room hiss, mic self-noise, etc.) rather than a played/sung note,
+        // and its RMS is folded into a running average. Once calibration completes, the
+        // voice/instrument-activity gate becomes a multiple of that measured floor (clamped
+        // to a sane range) instead of the single fixed thresholdRms -- this keeps sensitive
+        // mics from treating constant background hiss as "notes", and keeps noisy-room
+        // recordings from gating out real playing. Before calibration finishes, thresholdRms
+        // is used as-is.
+        if (adaptiveNoiseFloor == null) {
+            noiseCalibrationRmsSum += rms
+            noiseCalibrationFrameCount++
+            noiseCalibrationElapsedMs += frameDurationMs
+            if (noiseCalibrationElapsedMs >= NOISE_CALIBRATION_MS) {
+                adaptiveNoiseFloor = noiseCalibrationRmsSum / noiseCalibrationFrameCount.coerceAtLeast(1)
+            }
+        }
+
+        val effectiveThresholdRms = adaptiveNoiseFloor?.let { floor ->
+            (floor * NOISE_FLOOR_MULTIPLIER).coerceIn(MIN_ADAPTIVE_THRESHOLD, MAX_ADAPTIVE_THRESHOLD)
+        } ?: thresholdRms
+
         // Feed the rolling analysis buffer regardless of RMS gate, so it stays warm.
         pushToAnalysisBuffer(samples)
 
-        if (rms < thresholdRms) {
+        if (rms < effectiveThresholdRms) {
             finalizeMeasureIfNeeded()
             return DetectionResult(
                 chord = null,

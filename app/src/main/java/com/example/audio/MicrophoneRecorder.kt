@@ -12,7 +12,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 
 class MicrophoneRecorder(private val context: Context) {
 
@@ -23,6 +22,20 @@ class MicrophoneRecorder(private val context: Context) {
     val sampleRate = 44100
     private val channelConfig = AudioFormat.CHANNEL_IN_MONO
     private val audioFormat = AudioFormat.ENCODING_PCM_16BIT
+
+    // Single-threaded (but thread-pool-backed) dispatcher used to deliver PCM chunks to the
+    // caller's callback. Using limitedParallelism(1) on Dispatchers.Default instead of
+    // Dispatchers.Main means:
+    //  - Callback delivery -- and any downstream chord/pitch detection the caller does inside
+    //    it (a ~16k-point FFT per chunk in ChromaChordDetector) -- never runs on the main
+    //    thread, so it can no longer cause UI jank or dropped frames.
+    //  - Chunks are still delivered strictly one-at-a-time, in order, matching the previous
+    //    Dispatchers.Main behavior. This matters because ChromaChordDetector holds mutable
+    //    per-session state (rolling analysis buffer, per-measure vote tally, key-stability
+    //    tracking) that is only safe to mutate from one thread at a time -- plain
+    //    Dispatchers.Default would let multiple chunks run concurrently on different threads
+    //    and could corrupt that state.
+    private val callbackDispatcher = Dispatchers.Default.limitedParallelism(1)
 
     fun hasPermission(): Boolean {
         return ContextCompat.checkSelfPermission(
@@ -76,10 +89,13 @@ class MicrophoneRecorder(private val context: Context) {
                     val readSize = audioRecord?.read(buffer, 0, buffer.size) ?: -1
                     if (readSize > 0) {
                         val chunk = buffer.copyOf(readSize)
-                        // Fire-and-forget so heavier chord-detection processing downstream
+                        // Fire-and-forget onto callbackDispatcher (off the main thread, but
+                        // still serialized) so heavier chord-detection processing downstream
                         // can never throttle how fast we drain the AudioRecord buffer --
-                        // otherwise mic reads back up and real-time listening gets laggy.
-                        scope.launch(Dispatchers.Main) {
+                        // otherwise mic reads back up and real-time listening gets laggy --
+                        // and so that processing no longer competes with UI rendering on the
+                        // main thread.
+                        scope.launch(callbackDispatcher) {
                             onPcmBuffer(chunk)
                         }
                     }

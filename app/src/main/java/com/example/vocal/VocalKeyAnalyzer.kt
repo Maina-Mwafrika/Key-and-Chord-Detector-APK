@@ -19,6 +19,20 @@ class VocalKeyAnalyzer(private val sampleRate: Int = 44100) {
         private val MAJOR_PROFILE = doubleArrayOf(6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88)
         private val MINOR_PROFILE = doubleArrayOf(6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 2.69, 3.34, 3.17, 3.28)
 
+        // --- Adaptive noise floor tuning (post-hoc analysis of a full recording) ---
+        // A single fixed RMS gate is either too strict for a quiet mic/singer or too loose
+        // (picks up breath noise / room hiss) for a hot mic. Instead, estimate a noise floor
+        // directly from this recording's own RMS distribution: most singing has real silence
+        // or breath gaps between phrases, so a low percentile of all analysis windows' RMS
+        // values is a reasonable stand-in for "ambient noise" even without a dedicated silent
+        // calibration period at the start. The gate is then set as a multiple of that floor,
+        // clamped to a sane range so a recording with no quiet moments at all doesn't end up
+        // with a near-zero (everything passes) or absurdly high (nothing passes) threshold.
+        private const val NOISE_FLOOR_PERCENTILE = 0.15
+        private const val NOISE_FLOOR_MULTIPLIER = 2.5f
+        private const val MIN_ADAPTIVE_RMS_THRESHOLD = 0.006f
+        private const val MAX_ADAPTIVE_RMS_THRESHOLD = 0.05f
+
         fun midiToNoteName(midi: Int): String {
             val noteIndex = ((midi % 12) + 12) % 12
             val octave = (midi / 12) - 1
@@ -56,39 +70,70 @@ class VocalKeyAnalyzer(private val sampleRate: Int = 44100) {
 
         Log.d(TAG, "Processing ${pcmBuffers.size} audio buffers")
 
+        // Flatten all mic chunks into one continuous stream first. Individual
+        // AudioRecord reads are ~2048 samples -- smaller than the 4096-sample
+        // analysis window -- so windowing per-buffer (the old code) could never
+        // fit a single full window and silently produced zero frames on every
+        // recording, forcing the hardcoded fallback below. Concatenating lets
+        // windows span buffer boundaries so real chroma/pitch data is captured.
+        val totalSamples = pcmBuffers.sumOf { it.size }
+        val floatBuf = FloatArray(totalSamples)
+        var writeOffset = 0
         for (buffer in pcmBuffers) {
-            if (buffer.isEmpty()) continue
+            for (s in buffer) {
+                floatBuf[writeOffset++] = s / 32768.0f
+            }
+        }
 
-            val floatBuf = FloatArray(buffer.size) { buffer[it] / 32768.0f }
-            var offset = 0
+        // --- Pass 1: estimate an adaptive RMS gate from this recording's own noise floor,
+        // instead of relying on one fixed threshold across every mic/room. Cheap: only
+        // computes RMS per window, no chroma/pitch extraction yet. ---
+        val windowRmsValues = mutableListOf<Float>()
+        run {
+            var probeOffset = 0
+            while (probeOffset + windowSize <= floatBuf.size) {
+                floatBuf.copyInto(window, 0, probeOffset, probeOffset + windowSize)
+                windowRmsValues.add(calculateRms(window))
+                probeOffset += stepSize
+            }
+        }
+        val adaptiveThreshold = if (windowRmsValues.isNotEmpty()) {
+            val sorted = windowRmsValues.sorted()
+            val floorIdx = (sorted.size * NOISE_FLOOR_PERCENTILE).toInt().coerceIn(0, sorted.size - 1)
+            val noiseFloor = sorted[floorIdx]
+            (noiseFloor * NOISE_FLOOR_MULTIPLIER).coerceIn(MIN_ADAPTIVE_RMS_THRESHOLD, MAX_ADAPTIVE_RMS_THRESHOLD)
+        } else {
+            0.015f
+        }
+        Log.d(TAG, "Adaptive vocal RMS threshold: $adaptiveThreshold (${windowRmsValues.size} probe windows)")
 
-            while (offset + windowSize <= floatBuf.size) {
-                floatBuf.copyInto(window, 0, offset, offset + windowSize)
-                val rms = calculateRms(window)
-                frameCount++
+        // --- Pass 2: real chroma/pitch extraction, gated by the adaptive threshold above ---
+        var offset = 0
+        while (offset + windowSize <= floatBuf.size) {
+            floatBuf.copyInto(window, 0, offset, offset + windowSize)
+            val rms = calculateRms(window)
+            frameCount++
 
-                // Lower threshold for better detection
-                if (rms > 0.015f) {
-                    val chroma = detector.analyzeChroma(window)
-                    
-                    // Debug: Check if chroma is valid
-                    val chromaSum = chroma.sum()
-                    if (chromaSum > 0.01f) {
-                        val frameChroma = FloatArray(12)
-                        for (i in 0 until 12) {
-                            allChroma[i] += chroma[i]
-                            frameChroma[i] = chroma[i]
-                        }
-                        timeFrameChromaList.add(frameChroma)
+            if (rms > adaptiveThreshold) {
+                val chroma = detector.analyzeChroma(window)
 
-                        val pitchMidi = estimatePitchAutocorrelation(window, sampleRate)
-                        if (pitchMidi in 36..88) {
-                            pitchMidiList.add(pitchMidi)
-                        }
+                // Debug: Check if chroma is valid
+                val chromaSum = chroma.sum()
+                if (chromaSum > 0.01f) {
+                    val frameChroma = FloatArray(12)
+                    for (i in 0 until 12) {
+                        allChroma[i] += chroma[i]
+                        frameChroma[i] = chroma[i]
+                    }
+                    timeFrameChromaList.add(frameChroma)
+
+                    val pitchMidi = estimatePitchAutocorrelation(window, sampleRate)
+                    if (pitchMidi in 36..88) {
+                        pitchMidiList.add(pitchMidi)
                     }
                 }
-                offset += stepSize
             }
+            offset += stepSize
         }
 
         window.fill(0f)
