@@ -61,6 +61,23 @@ class ChromaChordDetector(private val sampleRate: Int = 44100) {
         private const val NOISE_FLOOR_MULTIPLIER = 3f
         private const val MIN_ADAPTIVE_THRESHOLD = 0.004f
         private const val MAX_ADAPTIVE_THRESHOLD = 0.05f
+
+        // --- Chord-match accuracy tuning ---
+        // A pitch class counts as an actually-sounding chord tone only once its normalized
+        // chroma energy clears this bar. Used by evaluateChordScore's "completeness" check so
+        // a single loud bin can't make an unrelated chord look like a good match.
+        private const val NOTE_PRESENCE_THRESHOLD = 0.18f
+        // How much a chord's score is scaled down when few of its notes are actually present,
+        // even if the notes that ARE present line up well. 0 completeness -> this floor;
+        // full completeness -> 1.0 (no penalty).
+        private const val COMPLETENESS_SCORE_FLOOR = 0.35f
+        // Bonus multiplier applied when the chord's root matches the detected bass-register
+        // pitch class -- the bass note is a much stronger root indicator than overall energy.
+        private const val BASS_ROOT_MATCH_BONUS = 1.2f
+        // Bass-register search range (Hz) used to find the "actual" bass note, roughly a
+        // guitar's low E through the octave above it.
+        private const val BASS_SEARCH_MIN_HZ = 70f
+        private const val BASS_SEARCH_MAX_HZ = 260f
     }
 
     // Public so SongAnalyzer can build filtered candidate lists (e.g. diatonic-only chords
@@ -82,7 +99,11 @@ class ChromaChordDetector(private val sampleRate: Int = 44100) {
     private var candidateKeyElapsedMs: Float = 0f
 
     // --- Measure-based chord sustain state (live streaming path) ---
-    // name -> (cumulative confidence, vote count). Null key represents "no clear chord".
+    // name -> (cumulative confidence^2 weight, vote count). Null key represents "no clear
+    // chord". Weighting by confidence^2 (rather than raw confidence) so a handful of clean,
+    // complete-chord matches outvote many noisy/partial-match frames instead of just
+    // averaging with them -- this is what stops the displayed chord from flickering between
+    // several plausible candidates within a single measure.
     private var measureVotes = HashMap<String?, Pair<Float, Int>>()
     private var measureElapsedMs: Float = 0f
     private var currentMeasureChord: ChordInfo? = null
@@ -219,6 +240,13 @@ class ChromaChordDetector(private val sampleRate: Int = 44100) {
         val (magnitudes, chromaVector) = computeMagnitudesAndChroma(analysisBuffer)
         val binWidthHz = sampleRate.toFloat() / ANALYSIS_WINDOW_SIZE
 
+        // 3b. Identify the loudest pitch class in the bass register. A chord's root is far
+        //     better identified from its bass note than from whichever pitch class happens
+        //     to be loudest overall (which is often a doubled string, an overtone, or the
+        //     melody note ringing on top) -- this directly targets the "detection latches
+        //     onto a note that actually belongs to a different chord" problem.
+        val bassPitchClass = estimateBassPitchClass(magnitudes, binWidthHz)
+
         // 4. Smooth Chroma Vector across a few recent frames (short-term, for live chroma
         //    bar / string-energy visuals -- intentionally NOT the same signal used for key
         //    estimation below).
@@ -260,14 +288,16 @@ class ChromaChordDetector(private val sampleRate: Int = 44100) {
 
         // 7. Template Match against Chord Database with Unbiased Scoring (per-frame best
         //    guess -- this feeds the per-measure vote below rather than being shown directly).
-        val (bestChord, confidence) = matchChord(smoothedChroma)
+        val (bestChord, confidence) = matchChord(smoothedChroma, bassPitchClass = bassPitchClass)
 
-        // 8. Cast this frame's vote into the current measure's tally, weighted by confidence
-        //    so a clean strong match counts more than a noisy weak one.
+        // 8. Cast this frame's vote into the current measure's tally, weighted by
+        //    confidence^2 so a handful of clean, complete-chord matches decisively outvote
+        //    many noisy/ambiguous frames instead of being diluted by averaging with them.
         if (confidence > MEASURE_VOTE_MIN_CONFIDENCE) {
             val voteKey = bestChord?.name
             val prev = measureVotes[voteKey] ?: (0f to 0)
-            measureVotes[voteKey] = (prev.first + confidence) to (prev.second + 1)
+            val weighted = confidence * confidence
+            measureVotes[voteKey] = (prev.first + weighted) to (prev.second + 1)
         }
         finalizeMeasureIfNeeded()
 
@@ -294,8 +324,19 @@ class ChromaChordDetector(private val sampleRate: Int = 44100) {
      * exactly the same signal processing as the live streaming path.
      */
     fun analyzeChroma(samples: FloatArray, offset: Int = 0, length: Int = samples.size): FloatArray {
+        return analyzeChromaWithBass(samples, offset, length).first
+    }
+
+    /**
+     * Same analysis as [analyzeChroma], but also returns the loudest bass-register pitch
+     * class (or -1 if the window is silent/too quiet to trust). SongAnalyzer's offline
+     * per-measure matching uses this so chord root identification -- not just overall
+     * template similarity -- is grounded in the actual bass note, exactly like the live
+     * streaming path does inside processPcmSamples().
+     */
+    fun analyzeChromaWithBass(samples: FloatArray, offset: Int = 0, length: Int = samples.size): Pair<FloatArray, Int> {
         if (length <= 0 || offset < 0 || offset + length > samples.size) {
-            return FloatArray(12)
+            return FloatArray(12) to -1
         }
 
         // Cheap RMS check: skip near-silent windows before running filter + 16384-point FFT
@@ -312,10 +353,43 @@ class ChromaChordDetector(private val sampleRate: Int = 44100) {
         }
         val approxRms = sqrt(sumSq / count.coerceAtLeast(1))
         if (approxRms < 0.003f) {
-            return FloatArray(12)
+            return FloatArray(12) to -1
         }
 
-        return computeMagnitudesAndChroma(samples, offset, length).second
+        val (magnitudes, chroma) = computeMagnitudesAndChroma(samples, offset, length)
+        val binWidthHz = sampleRate.toFloat() / length
+        val bassPitchClass = estimateBassPitchClass(magnitudes, binWidthHz)
+        return chroma to bassPitchClass
+    }
+
+    /**
+     * Finds the loudest pitch class within the guitar's bass/root register only
+     * (roughly E2-B2, ~70-260Hz). A chord's identity is defined far more reliably by its
+     * bass note than by whatever pitch class happens to ring loudest across the whole
+     * spectrum -- the overall-loudest bin is often a doubled string, a harmonic overtone,
+     * or a melody note ringing on top, any of which can point evaluateChordScore toward a
+     * chord that isn't actually the one being played. Returns -1 if the bass register has
+     * no meaningful energy (can't be trusted as a root hint).
+     */
+    private fun estimateBassPitchClass(magnitudes: FloatArray, binWidthHz: Float): Int {
+        if (binWidthHz <= 0f) return -1
+        val lowBin = (BASS_SEARCH_MIN_HZ / binWidthHz).toInt().coerceAtLeast(1)
+        val highBin = (BASS_SEARCH_MAX_HZ / binWidthHz).toInt().coerceAtMost(magnitudes.size - 1)
+        if (lowBin > highBin) return -1
+
+        var bestBin = -1
+        var bestMag = 0f
+        for (bin in lowBin..highBin) {
+            if (magnitudes[bin] > bestMag) {
+                bestMag = magnitudes[bin]
+                bestBin = bin
+            }
+        }
+        if (bestBin < 0 || bestMag < 0.001f) return -1
+
+        val freq = bestBin * binWidthHz
+        val midiPitch = 69.0f + 12.0f * log2(freq / 440.0f)
+        return (midiPitch.roundToInt() % 12 + 12) % 12
     }
 
     /**
@@ -323,13 +397,23 @@ class ChromaChordDetector(private val sampleRate: Int = 44100) {
      * to the full chord database). Returns the chord and a 0..1 confidence score. Shared by
      * the live streaming path and SongAnalyzer's offline per-measure matching -- SongAnalyzer
      * passes a restricted candidate list (diatonic-only) for "Simple" mode.
+     *
+     * @param bassPitchClass the loudest pitch class in the bass register (from
+     *   [estimateBassPitchClass] / [analyzeChromaWithBass]), or -1 if unknown. When a
+     *   candidate chord's root matches this, its score gets a bonus -- this is what lets
+     *   the detector correctly favor (say) an Am chord over a C chord even though both
+     *   share two of the same notes, as long as the bass is clearly on A.
      */
-    fun matchChord(chroma: FloatArray, candidates: List<ChordInfo> = chordDatabase): Pair<ChordInfo?, Float> {
+    fun matchChord(
+        chroma: FloatArray,
+        candidates: List<ChordInfo> = chordDatabase,
+        bassPitchClass: Int = -1
+    ): Pair<ChordInfo?, Float> {
         var bestChord: ChordInfo? = null
         var bestScore = 0f
 
         for (chord in candidates) {
-            val score = evaluateChordScore(chroma, chord)
+            val score = evaluateChordScore(chroma, chord, bassPitchClass)
             if (score > bestScore) {
                 bestScore = score
                 bestChord = chord
@@ -377,7 +461,7 @@ class ChromaChordDetector(private val sampleRate: Int = 44100) {
 
     /**
      * If a full measure's worth of real audio time has elapsed, commit whichever chord
-     * accumulated the most confidence-weighted votes as the chord to display, and hold it
+     * accumulated the most confidence^2-weighted votes as the chord to display, and hold it
      * until the next measure boundary. This is what makes the on-screen chord change on
      * bar boundaries instead of flickering every FFT frame.
      */
@@ -391,7 +475,11 @@ class ChromaChordDetector(private val sampleRate: Int = 44100) {
         } else {
             null
         }
-        currentMeasureConfidence = winnerEntry?.let { it.value.first / it.value.second } ?: 0f
+        // Votes were accumulated as confidence^2 (see processPcmSamples step 8); take the
+        // square root back to restore a genuine 0..1 confidence value for display.
+        currentMeasureConfidence = winnerEntry?.let {
+            if (it.value.second > 0) sqrt((it.value.first / it.value.second).toDouble()).toFloat() else 0f
+        } ?: 0f
 
         measureVotes = HashMap()
         measureElapsedMs = 0f
@@ -471,9 +559,9 @@ class ChromaChordDetector(private val sampleRate: Int = 44100) {
     /**
      * Shared core of chroma extraction: low-pass filter -> Hanning-windowed FFT -> 12-bin
      * chroma vector. Returns both the raw FFT magnitude spectrum (needed by the live path
-     * for guitar string-energy calculation) and the normalized chroma vector. Used by both
-     * processPcmSamples (live) and analyzeChroma (offline), so the two paths can never
-     * silently diverge in behavior.
+     * for guitar string-energy calculation and bass-note detection) and the normalized
+     * chroma vector. Used by both processPcmSamples (live) and analyzeChromaWithBass
+     * (offline), so the two paths can never silently diverge in behavior.
      */
     private fun computeMagnitudesAndChroma(
         samples: FloatArray,
@@ -556,8 +644,20 @@ class ChromaChordDetector(private val sampleRate: Int = 44100) {
     /**
      * Unbiased Chord Evaluator:
      * Evaluates chord match without favoring any specific root or template position.
+     *
+     * Two accuracy improvements over a plain weighted-energy match:
+     *  1. "Completeness" -- a chord only scores well if most of ITS OWN notes are actually
+     *     audible (>= NOTE_PRESENCE_THRESHOLD), not just whichever single note happens to be
+     *     loudest. Without this, one strong pitch class (a doubled string, an overtone, mic
+     *     bleed) can make an unrelated chord that merely contains that note look like a
+     *     decent match, which is what causes detection to jump between several chords that
+     *     all happen to share one note.
+     *  2. Bass-root agreement -- if the chord's root matches the actual bass-register pitch
+     *     class (passed in from estimateBassPitchClass), its score gets a bonus. This lets
+     *     e.g. Am correctly outscore C even though they share two notes, whenever the bass
+     *     is clearly on A rather than C.
      */
-    private fun evaluateChordScore(chroma: FloatArray, chord: ChordInfo): Float {
+    private fun evaluateChordScore(chroma: FloatArray, chord: ChordInfo, bassPitchClass: Int = -1): Float {
         val template = FloatArray(12)
         for (note in chord.notes) {
             val idx = NOTE_NAMES.indexOf(note)
@@ -577,11 +677,16 @@ class ChromaChordDetector(private val sampleRate: Int = 44100) {
         var matchedEnergy = 0f
         var unmatchedNoiseEnergy = 0f
         var templateSum = 0f
+        var presentNoteCount = 0
+        val templateNoteCount = chord.notes.distinct().size
 
         for (i in 0 until 12) {
             templateSum += normTemplate[i]
             if (normTemplate[i] > 0f) {
                 matchedEnergy += chroma[i] * normTemplate[i]
+                if (chroma[i] >= NOTE_PRESENCE_THRESHOLD) {
+                    presentNoteCount++
+                }
             } else {
                 if (chroma[i] > 0.2f) {
                     unmatchedNoiseEnergy += chroma[i] * 0.35f
@@ -589,10 +694,22 @@ class ChromaChordDetector(private val sampleRate: Int = 44100) {
             }
         }
 
-        if (templateSum == 0f) return 0f
+        if (templateSum == 0f || templateNoteCount == 0) return 0f
         val matchRatio = matchedEnergy / templateSum
 
-        return (matchRatio - unmatchedNoiseEnergy).coerceIn(0f, 1f)
+        // A chord shouldn't win just because ONE loud note happens to be in its template --
+        // most of its notes need to actually be audible. The floor keeps a partial-but-real
+        // match from being zeroed out entirely.
+        val completeness = presentNoteCount.toFloat() / templateNoteCount
+        val completenessFactor = COMPLETENESS_SCORE_FLOOR + (1f - COMPLETENESS_SCORE_FLOOR) * completeness
+
+        var score = ((matchRatio * completenessFactor) - unmatchedNoiseEnergy).coerceIn(0f, 1f)
+
+        if (bassPitchClass >= 0 && rootIdx == bassPitchClass) {
+            score = (score * BASS_ROOT_MATCH_BONUS).coerceAtMost(1f)
+        }
+
+        return score
     }
 
     private fun pearsonCorrelation(x: FloatArray, y: FloatArray): Float {

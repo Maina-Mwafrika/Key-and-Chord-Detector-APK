@@ -13,6 +13,7 @@ import kotlinx.coroutines.withContext
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.math.sqrt
 
 /**
  * Performs a one-time, offline (non-real-time) analysis of an uploaded song: decodes the
@@ -66,14 +67,20 @@ class SongAnalyzer(private val context: Context) {
             chunks.map { (startHop, endHop) ->
                 async(Dispatchers.Default) {
                     val localDetector = ChromaChordDetector(sampleRate = decoded.sampleRate)
-                    val list = ArrayList<Pair<Long, FloatArray>>(endHop - startHop)
+                    // Triple = (timestampMs, chroma, bassPitchClass). The bass pitch class is
+                    // the loudest pitch class in the guitar's low register for this window --
+                    // carrying it through to Pass 2 lets matchChord anchor each measure's
+                    // chord root to what the bass is actually doing, instead of relying only
+                    // on overall chroma-template similarity (which can be fooled by a single
+                    // loud note that happens to belong to a different chord).
+                    val list = ArrayList<Triple<Long, FloatArray, Int>>(endHop - startHop)
                     for (hop in startHop until endHop) {
                         val pos = hop * hopSize
                         if (pos + windowSize <= samples.size) {
                             // Zero-copy window analysis with cheap RMS skip & in-place FFT
-                            val chroma = localDetector.analyzeChroma(samples, pos, windowSize)
+                            val (chroma, bassPitchClass) = localDetector.analyzeChromaWithBass(samples, pos, windowSize)
                             val timestampMs = (pos.toLong() * 1000L) / decoded.sampleRate
-                            list.add(timestampMs to chroma)
+                            list.add(Triple(timestampMs, chroma, bassPitchClass))
                         }
                         val done = completedHops.incrementAndGet()
                         if (done % 30 == 0 || done == totalHops) {
@@ -86,10 +93,10 @@ class SongAnalyzer(private val context: Context) {
             }.awaitAll()
         }
 
-        val hopChromas = ArrayList<Pair<Long, FloatArray>>(totalHops)
+        val hopChromas = ArrayList<Triple<Long, FloatArray, Int>>(totalHops)
         for (list in workerResults) {
-            for ((timestampMs, chroma) in list) {
-                hopChromas.add(timestampMs to chroma)
+            for ((timestampMs, chroma, bassPitchClass) in list) {
+                hopChromas.add(Triple(timestampMs, chroma, bassPitchClass))
                 for (i in 0 until 12) {
                     globalChroma[i] += chroma[i]
                 }
@@ -108,6 +115,18 @@ class SongAnalyzer(private val context: Context) {
             ChordComplexityMode.ADVANCED -> detector.chordDatabase
         }.ifEmpty { detector.chordDatabase }
 
+        // Soft in-key bias for Advanced mode only: Advanced still allows ANY chord (including
+        // borrowed/chromatic ones) to win a measure, but a marginal/ambiguous hop should lean
+        // toward the song's own key rather than flipping to an unrelated out-of-key chord just
+        // because of one noisy frame. This is a mild nudge applied to the vote weight below,
+        // not a restriction on candidates -- a genuinely well-matched borrowed chord still
+        // wins comfortably against it.
+        val inKeyBiasNames = if (chordMode == ChordComplexityMode.ADVANCED) {
+            diatonicChordNamesForKey(overallKey)
+        } else {
+            emptySet()
+        }
+
         // --- Pass 2: group hops into measures and vote for the best-fitting chord with smooth progress ---
         onProgress(Progress(0.80f, "Mapping chords to measures"))
         val measureDurationMs = ((60000f / bpm) * beatsPerMeasure).toLong().coerceAtLeast(250L)
@@ -117,14 +136,27 @@ class SongAnalyzer(private val context: Context) {
         val votesPerMeasure = Array(measureCount) { HashMap<String?, Pair<Float, Int>>() }
 
         val totalHopsInList = hopChromas.size.coerceAtLeast(1)
-        for ((idx, pair) in hopChromas.withIndex()) {
-            val (timestampMs, chroma) = pair
+        for ((idx, triple) in hopChromas.withIndex()) {
+            val (timestampMs, chroma, bassPitchClass) = triple
             val measureIdx = (timestampMs / measureDurationMs).toInt().coerceIn(0, measureCount - 1)
-            val (chord, confidence) = detector.matchChord(chroma, candidateChords)
-            if (confidence > 0.15f) {
+            val (chord, rawConfidence) = detector.matchChord(chroma, candidateChords, bassPitchClass)
+
+            val biasedConfidence = if (chord != null && chord.name in inKeyBiasNames) {
+                (rawConfidence * 1.08f).coerceAtMost(1f)
+            } else {
+                rawConfidence
+            }
+
+            if (biasedConfidence > 0.15f) {
                 val voteKey = chord?.name
                 val prev = votesPerMeasure[measureIdx][voteKey] ?: (0f to 0)
-                votesPerMeasure[measureIdx][voteKey] = (prev.first + confidence) to (prev.second + 1)
+                // Square the confidence weight so a handful of clean, complete-chord matches
+                // decisively outvote many noisy/partial-match hops instead of being averaged
+                // together with them -- this is what keeps a measure's displayed chord from
+                // flip-flopping between several plausible candidates due to a few ambiguous
+                // frames within that bar.
+                val weighted = biasedConfidence * biasedConfidence
+                votesPerMeasure[measureIdx][voteKey] = (prev.first + weighted) to (prev.second + 1)
             }
             if (idx % 100 == 0 || idx == totalHopsInList - 1) {
                 val pFrac = 0.80f + 0.18f * ((idx + 1).toFloat() / totalHopsInList.toFloat())
@@ -137,7 +169,11 @@ class SongAnalyzer(private val context: Context) {
             val winner = votes.maxByOrNull { it.value.first }
             val winnerName = winner?.key
             val chord = winnerName?.let { name -> candidateChords.find { it.name == name } }
-            val confidence = winner?.let { if (it.value.second > 0) it.value.first / it.value.second else 0f } ?: 0f
+            // Votes were accumulated as confidence^2 (see weighting above); take the square
+            // root back to restore a genuine 0..1 confidence value for display/history.
+            val confidence = winner?.let {
+                if (it.value.second > 0) sqrt((it.value.first / it.value.second).toDouble()).toFloat() else 0f
+            } ?: 0f
 
             MeasureChord(
                 measureIndex = idx,
@@ -171,7 +207,8 @@ class SongAnalyzer(private val context: Context) {
     /**
      * Returns the chord-database name strings (e.g. "C", "Dm", "Bdim") for the 7 diatonic
      * triads/7ths of the given key. Used to constrain "Simple" mode matching to chords that
-     * actually belong to the song's key.
+     * actually belong to the song's key, and to compute the soft in-key bias for "Advanced"
+     * mode above.
      */
     private fun diatonicChordNamesForKey(keyName: String): Set<String> {
         val isMinor = keyName.contains("Minor")
